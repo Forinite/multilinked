@@ -109,7 +109,8 @@ class MainActivity : Activity() {
 
     private fun neededPermissions(): Array<String> {
         val l = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT <= 32) l += Manifest.permission.ACCESS_FINE_LOCATION
+        l += Manifest.permission.ACCESS_COARSE_LOCATION
+        l += Manifest.permission.ACCESS_FINE_LOCATION
         if (Build.VERSION.SDK_INT >= 31) {
             l += Manifest.permission.BLUETOOTH_ADVERTISE
             l += Manifest.permission.BLUETOOTH_CONNECT
