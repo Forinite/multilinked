@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
@@ -39,11 +40,10 @@ import java.util.UUID
 import kotlin.random.Random
 
 /**
- * multilinked: offline chain-relay LIVE voice.
- * One phone is the SPEAKER: it records the mic in 40 ms frames and sends each frame
- * to its neighbours. Every phone forwards each frame to its other neighbours and
- * (unless it is the speaker) plays it straight away. Same relay rule as before,
- * but the "message" is a tiny slice of audio, and late/duplicate frames are dropped.
+ * multilinked: offline chain-relay LIVE voice (one speaker, everyone else listens).
+ * Audio: 8 kHz mono, 60 ms frames, compressed with mu-law to 8 KB/s per link.
+ * Each link may have at most [maxInFlight] frames waiting; beyond that frames are
+ * dropped, so a slow link gives choppy audio instead of ever-growing delay.
  */
 class MainActivity : Activity() {
 
@@ -54,19 +54,24 @@ class MainActivity : Activity() {
     private val neighbors = mutableMapOf<String, String>()    // endpointId -> device name
     private val pending = mutableMapOf<String, String>()
     private var running = false
+    private var locked = false
     private var myName = ""
     private var allowed = setOf<String>()                     // empty = link with anyone
     private var isSpeaker = false
 
-    // audio: 8 kHz, 16-bit, mono. 40 ms = 320 samples = 640 bytes (16 KB/s per link)
+    // audio: 480 samples (60 ms) -> 480 mu-law bytes on the wire, 960 bytes of PCM16 locally
     private val sampleRate = 8000
-    private val frameBytes = 640
-    private val prebufferFrames = 4                           // ~160 ms cushion before playing
+    private val frameSamples = 480
+    private val pcmFrameBytes = frameSamples * 2
+    private val prebufferFrames = 3                           // ~180 ms cushion before playing
 
-    // speaker side
+    // send queue limit per link
+    private val maxInFlight = 4
+    private val inFlight = HashMap<Long, Pair<String, Long>>()  // payloadId -> (endpoint, time sent)
+    private var dropped = 0
+
     @Volatile private var broadcasting = false
 
-    // relay + listener side
     private val lastSeq = HashMap<Int, Int>()                 // streamId -> newest frame number seen
     private var track: AudioTrack? = null
     private var curSid = 0
@@ -76,11 +81,17 @@ class MainActivity : Activity() {
     private val endRunnable = Runnable {
         if (track != null) { stopTrack(); addLine("[speaker stopped]") }
     }
+    private val tick = object : Runnable {
+        override fun run() {
+            if (running) { updateStatus(); handler.postDelayed(this, 2000) }
+        }
+    }
 
     private lateinit var nameInput: EditText
     private lateinit var allowedInput: EditText
     private lateinit var roleBtn: Button
     private lateinit var toggle: Button
+    private lateinit var lockBtn: Button
     private lateinit var statusView: TextView
     private lateinit var chatView: TextView
     private lateinit var scroll: ScrollView
@@ -110,6 +121,9 @@ class MainActivity : Activity() {
             text = "Start"
             setOnClickListener { if (running) stopNearby() else requestPermsThenStart() }
         }
+        lockBtn = Button(this).apply {
+            setOnClickListener { lockLinks() }
+        }
         statusView = TextView(this).apply { text = "Stopped"; setPadding(0, dp(6), 0, dp(6)) }
         chatView = TextView(this).apply { textSize = 16f }
         scroll = ScrollView(this).apply { addView(chatView) }
@@ -122,6 +136,7 @@ class MainActivity : Activity() {
         root.addView(allowedInput, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(roleBtn, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(toggle, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(lockBtn, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(statusView, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         root.addView(talkBtn, LinearLayout.LayoutParams(MATCH_PARENT, dp(100)))
@@ -137,6 +152,8 @@ class MainActivity : Activity() {
     private fun refreshButtons() {
         roleBtn.isEnabled = !running
         roleBtn.text = if (isSpeaker) "Role: SPEAKER (tap to change)" else "Role: Listener (tap to change)"
+        lockBtn.isEnabled = running && !locked
+        lockBtn.text = if (locked) "Links locked" else "Stop searching (lock links)"
         talkBtn.isEnabled = running && isSpeaker
         talkBtn.text = when {
             !isSpeaker -> "Listening (only the speaker can talk)"
@@ -188,23 +205,38 @@ class MainActivity : Activity() {
             .addOnFailureListener { statusView.text = "Discovery failed: ${it.message}" }
 
         running = true
+        locked = false
+        dropped = 0
         toggle.text = "Stop"
         nameInput.isEnabled = false
         allowedInput.isEnabled = false
         refreshButtons()
         updateStatus()
+        handler.postDelayed(tick, 2000)
+    }
+
+    // Stop searching/advertising so the radio is used for audio only
+    private fun lockLinks() {
+        client.stopAdvertising()
+        client.stopDiscovery()
+        locked = true
+        refreshButtons()
+        addLine("[search stopped: links locked]")
     }
 
     private fun stopNearby() {
         stopBroadcast()
         handler.removeCallbacks(endRunnable)
+        handler.removeCallbacks(tick)
         stopTrack()
         client.stopAdvertising()
         client.stopDiscovery()
         client.stopAllEndpoints()
         neighbors.clear()
         pending.clear()
+        inFlight.clear()
         running = false
+        locked = false
         toggle.text = "Start"
         nameInput.isEnabled = true
         allowedInput.isEnabled = true
@@ -214,7 +246,7 @@ class MainActivity : Activity() {
 
     private fun updateStatus() {
         val n = if (neighbors.isEmpty()) "none yet" else neighbors.values.joinToString(", ")
-        statusView.text = "Running as $myName | direct links: $n"
+        statusView.text = "Running as $myName | links: $n | frames dropped (slow link): $dropped"
     }
 
     // ---------- discovery + connections ----------
@@ -266,19 +298,19 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- packets: [streamId 4][frame number 4][hops 1][nameLen 1][name][pcm audio] ----------
+    // ---------- packets: [streamId 4][frame number 4][hops 1][nameLen 1][name][mu-law audio] ----------
 
     private val hopsOffset = 8
 
-    private fun encode(sid: Int, seq: Int, hops: Int, sender: String, pcm: ByteArray): ByteArray {
+    private fun encode(sid: Int, seq: Int, hops: Int, sender: String, audio: ByteArray): ByteArray {
         val nameBytes = sender.toByteArray().let { it.copyOf(minOf(it.size, 30)) }
-        val buf = ByteBuffer.allocate(10 + nameBytes.size + pcm.size)
+        val buf = ByteBuffer.allocate(10 + nameBytes.size + audio.size)
         buf.putInt(sid)
         buf.putInt(seq)
         buf.put(hops.toByte())
         buf.put(nameBytes.size.toByte())
         buf.put(nameBytes)
-        buf.put(pcm)
+        buf.put(audio)
         return buf.array()
     }
 
@@ -287,7 +319,13 @@ class MainActivity : Activity() {
             val bytes = payload.asBytes() ?: return
             try { handleIncoming(bytes, endpointId) } catch (_: Exception) {}
         }
-        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
+
+        // A sent frame has left the queue: free up a slot for that link
+        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
+            if (update.status != PayloadTransferUpdate.Status.IN_PROGRESS) {
+                inFlight.remove(update.payloadId)
+            }
+        }
     }
 
     // The relay rule, per audio frame: forward it onward, then play it here
@@ -298,7 +336,7 @@ class MainActivity : Activity() {
         val hops = buf.get().toInt() and 0xFF
         val nameLen = buf.get().toInt() and 0xFF
         val nameBytes = ByteArray(nameLen); buf.get(nameBytes)
-        val pcm = ByteArray(buf.remaining()); buf.get(pcm)
+        val audio = ByteArray(buf.remaining()); buf.get(audio)
 
         // Only accept frames newer than the last one: drops duplicates (loops) and late frames
         val last = lastSeq[sid]
@@ -309,13 +347,44 @@ class MainActivity : Activity() {
         forward[hopsOffset] = (hops + 1).toByte()
         sendToNeighbors(forward, from)
 
-        if (!isSpeaker) play(sid, String(nameBytes), hops + 1, pcm)
+        if (!isSpeaker) play(sid, String(nameBytes), hops + 1, audio)
     }
 
+    // Send to every neighbour except one, but never let a slow link build up a backlog
     private fun sendToNeighbors(packet: ByteArray, except: String?) {
+        val now = SystemClock.elapsedRealtime()
+        inFlight.entries.removeIf { now - it.value.second > 1000 }   // safety: forget stale entries
         for (endpoint in neighbors.keys) {
-            if (endpoint != except) client.sendPayload(endpoint, Payload.fromBytes(packet))
+            if (endpoint == except) continue
+            val waiting = inFlight.values.count { it.first == endpoint }
+            if (waiting >= maxInFlight) { dropped++; continue }       // link is behind: drop this frame
+            val payload = Payload.fromBytes(packet)
+            inFlight[payload.id] = Pair(endpoint, now)
+            client.sendPayload(endpoint, payload)
         }
+    }
+
+    // ---------- mu-law (G.711) compression: 16-bit sample <-> 8-bit ----------
+
+    private fun muLawEncode(sample: Int): Byte {
+        var s = sample
+        val sign = if (s < 0) 0x80 else 0
+        if (s < 0) s = -s
+        if (s > 32635) s = 32635
+        s += 0x84
+        var exponent = 7
+        var mask = 0x4000
+        while (exponent > 0 && (s and mask) == 0) { exponent--; mask = mask shr 1 }
+        val mantissa = (s shr (exponent + 3)) and 0x0F
+        return (sign or (exponent shl 4) or mantissa).inv().toByte()
+    }
+
+    private fun muLawDecode(b: Byte): Int {
+        val u = b.toInt().inv() and 0xFF
+        val exponent = (u shr 4) and 0x07
+        val mantissa = u and 0x0F
+        val sample = (((mantissa shl 3) + 0x84) shl exponent) - 0x84
+        return if ((u and 0x80) != 0) -sample else sample
     }
 
     // ---------- speaker: mic -> frames ----------
@@ -330,7 +399,7 @@ class MainActivity : Activity() {
         val rec = AudioRecord(
             MediaRecorder.AudioSource.MIC, sampleRate,
             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-            maxOf(minBuf, frameBytes * 4))
+            maxOf(minBuf, pcmFrameBytes * 4))
         if (rec.state != AudioRecord.STATE_INITIALIZED) {
             rec.release()
             statusView.text = "Could not open the microphone"
@@ -344,19 +413,24 @@ class MainActivity : Activity() {
         addLine("[you are broadcasting]")
 
         Thread {
-            val buf = ByteArray(frameBytes)
+            val pcm = ByteArray(pcmFrameBytes)
             var seq = 0
             try {
                 rec.startRecording()
                 while (broadcasting) {
                     var got = 0
-                    while (got < frameBytes && broadcasting) {
-                        val n = rec.read(buf, got, frameBytes - got)
+                    while (got < pcmFrameBytes && broadcasting) {
+                        val n = rec.read(pcm, got, pcmFrameBytes - got)
                         if (n <= 0) break
                         got += n
                     }
-                    if (got < frameBytes) break
-                    val packet = encode(sid, seq++, 0, myName, buf)
+                    if (got < pcmFrameBytes) break
+                    val audio = ByteArray(frameSamples)
+                    for (i in 0 until frameSamples) {
+                        val sample = (pcm[2 * i].toInt() and 0xFF) or (pcm[2 * i + 1].toInt() shl 8)
+                        audio[i] = muLawEncode(sample)
+                    }
+                    val packet = encode(sid, seq++, 0, myName, audio)
                     handler.post { sendToNeighbors(packet, null) }   // send from the main thread
                 }
             } finally {
@@ -401,9 +475,15 @@ class MainActivity : Activity() {
         addLine("$sender is speaking ($hops hop${if (hops == 1) "" else "s"})")
     }
 
-    private fun play(sid: Int, sender: String, hops: Int, pcm: ByteArray) {
+    private fun play(sid: Int, sender: String, hops: Int, audio: ByteArray) {
         if (track == null || sid != curSid) startTrack(sid, sender, hops)
         val t = track ?: return
+        val pcm = ByteArray(audio.size * 2)
+        for (i in audio.indices) {
+            val s = muLawDecode(audio[i])
+            pcm[2 * i] = (s and 0xFF).toByte()
+            pcm[2 * i + 1] = ((s shr 8) and 0xFF).toByte()
+        }
         t.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
         framesQueued++
         if (!trackStarted && framesQueued >= prebufferFrames) {

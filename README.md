@@ -17,7 +17,7 @@ Set these in the app, then press Start on each. Set Role to SPEAKER on phone A o
 | 3     | C    | B,D            | Listener |
 | 4     | D    | C              | Listener |
 
-On A press "Start broadcasting" and talk. B, C and D play it; D's log shows "A is speaking (3 hops)".
+Wait until every phone shows its links, press "Stop searching (lock links)" on each, then on A press "Start broadcasting" and talk. If the "frames dropped" number in the status line keeps rising on a phone, its link to the next phone is too slow. B, C and D play it; D's log shows "A is speaking (3 hops)".
 
 ## Build without Android Studio (GitHub)
 Push this folder to a GitHub repo. The workflow in .github/workflows builds the APK automatically.
