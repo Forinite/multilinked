@@ -2,32 +2,41 @@ package com.example.multilinked
 
 import android.Manifest
 import android.app.Activity
+import android.bluetooth.BluetoothManager
+import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.graphics.Typeface
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.AdvertisingOptions
 import com.google.android.gms.nearby.connection.ConnectionInfo
 import com.google.android.gms.nearby.connection.ConnectionLifecycleCallback
 import com.google.android.gms.nearby.connection.ConnectionResolution
 import com.google.android.gms.nearby.connection.ConnectionsClient
+import com.google.android.gms.nearby.connection.ConnectionsStatusCodes
 import com.google.android.gms.nearby.connection.DiscoveredEndpointInfo
 import com.google.android.gms.nearby.connection.DiscoveryOptions
 import com.google.android.gms.nearby.connection.EndpointDiscoveryCallback
@@ -35,15 +44,21 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
+import java.io.File
 import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import kotlin.random.Random
 
 /**
  * multilinked: offline chain-relay LIVE voice (one speaker, everyone else listens).
- * Audio: 8 kHz mono, 60 ms frames, compressed with mu-law to 8 KB/s per link.
- * Each link may have at most [maxInFlight] frames waiting; beyond that frames are
- * dropped, so a slow link gives choppy audio instead of ever-growing delay.
+ *
+ * Session  = name/role/allowed list are fixed, existing links stay up.
+ * Search   = advertise + discover for new links. Stops at the first new link or after
+ *            [searchSeconds]; can be started again at any time without dropping links.
+ * Log      = every event is timestamped, kept in memory and in a file, viewable in-app.
  */
 class MainActivity : Activity() {
 
@@ -52,23 +67,36 @@ class MainActivity : Activity() {
     private lateinit var client: ConnectionsClient
 
     private val neighbors = mutableMapOf<String, String>()    // endpointId -> device name
-    private val pending = mutableMapOf<String, String>()
+    private val pending = mutableMapOf<String, String>()      // endpointId -> device name (connecting)
+    private val pendingSince = mutableMapOf<String, Long>()
     private var running = false
-    private var locked = false
+    private var searching = false
     private var myName = ""
     private var allowed = setOf<String>()                     // empty = link with anyone
     private var isSpeaker = false
+    private val searchSeconds = 30
 
     // audio: 480 samples (60 ms) -> 480 mu-law bytes on the wire, 960 bytes of PCM16 locally
     private val sampleRate = 8000
     private val frameSamples = 480
     private val pcmFrameBytes = frameSamples * 2
-    private val prebufferFrames = 3                           // ~180 ms cushion before playing
+    private val prebufferFrames = 3
 
     // send queue limit per link
     private val maxInFlight = 4
     private val inFlight = HashMap<Long, Pair<String, Long>>()  // payloadId -> (endpoint, time sent)
     private var dropped = 0
+
+    // statistics, summarised in the log every ~6 s
+    private class LinkStats {
+        var sent = 0; var dropped = 0; var done = 0; var failed = 0
+        var sumMs = 0L; var maxMs = 0L
+    }
+    private val txStats = HashMap<String, LinkStats>()
+    private var rxFrames = 0
+    private var rxGaps = 0
+    private var rxStale = 0
+    private var tickCount = 0
 
     @Volatile private var broadcasting = false
 
@@ -78,20 +106,38 @@ class MainActivity : Activity() {
     private var framesQueued = 0
     private var trackStarted = false
     private val handler = Handler(Looper.getMainLooper())
+
     private val endRunnable = Runnable {
         if (track != null) { stopTrack(); addLine("[speaker stopped]") }
     }
+    private val searchTimeout = Runnable { stopSearch("timed out after $searchSeconds s") }
     private val tick = object : Runnable {
         override fun run() {
-            if (running) { updateStatus(); handler.postDelayed(this, 2000) }
+            if (!running) return
+            updateStatus()
+            clearStalePending()
+            tickCount++
+            if (tickCount % 3 == 0) logStats()
+            handler.postDelayed(this, 2000)
         }
     }
 
+    // log
+    private val logLines = ArrayList<String>()
+    private val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    private val logFile by lazy { File(filesDir, "multilinked.log") }
+    private var logVisible = false
+
+    // views
+    private lateinit var mainView: LinearLayout
+    private lateinit var logPanel: LinearLayout
+    private lateinit var logText: TextView
+    private lateinit var logScroll: ScrollView
     private lateinit var nameInput: EditText
     private lateinit var allowedInput: EditText
     private lateinit var roleBtn: Button
     private lateinit var toggle: Button
-    private lateinit var lockBtn: Button
+    private lateinit var searchBtn: Button
     private lateinit var statusView: TextView
     private lateinit var chatView: TextView
     private lateinit var scroll: ScrollView
@@ -99,12 +145,18 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    private fun row(vararg views: View): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        for (v in views) addView(v, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         client = Nearby.getConnectionsClient(this)
 
-        val root = LinearLayout(this).apply {
+        // ----- main screen -----
+        mainView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(12), dp(12), dp(12))
         }
@@ -118,11 +170,14 @@ class MainActivity : Activity() {
             setOnClickListener { isSpeaker = !isSpeaker; refreshButtons() }
         }
         toggle = Button(this).apply {
-            text = "Start"
-            setOnClickListener { if (running) stopNearby() else requestPermsThenStart() }
+            setOnClickListener { if (running) stopSession() else requestPermsThenStart() }
         }
-        lockBtn = Button(this).apply {
-            setOnClickListener { lockLinks() }
+        searchBtn = Button(this).apply {
+            setOnClickListener { if (searching) stopSearch("stopped by you") else startSearch() }
+        }
+        val logsBtn = Button(this).apply {
+            text = "Show logs"
+            setOnClickListener { showLogs(true) }
         }
         statusView = TextView(this).apply { text = "Stopped"; setPadding(0, dp(6), 0, dp(6)) }
         chatView = TextView(this).apply { textSize = 16f }
@@ -132,34 +187,160 @@ class MainActivity : Activity() {
             setOnClickListener { if (broadcasting) stopBroadcast() else startBroadcast() }
         }
 
-        root.addView(nameInput, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(allowedInput, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(roleBtn, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(toggle, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(lockBtn, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(statusView, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-        root.addView(talkBtn, LinearLayout.LayoutParams(MATCH_PARENT, dp(100)))
+        mainView.addView(nameInput, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        mainView.addView(allowedInput, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        mainView.addView(roleBtn, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        mainView.addView(row(toggle, searchBtn), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        mainView.addView(logsBtn, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        mainView.addView(statusView, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        mainView.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        mainView.addView(talkBtn, LinearLayout.LayoutParams(MATCH_PARENT, dp(100)))
+
+        // ----- log screen -----
+        logPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            visibility = View.GONE
+        }
+        val backBtn = Button(this).apply { text = "Back"; setOnClickListener { showLogs(false) } }
+        val shareBtn = Button(this).apply { text = "Share"; setOnClickListener { shareLog() } }
+        val clearBtn = Button(this).apply {
+            text = "Clear"
+            setOnClickListener {
+                logLines.clear()
+                try { logFile.writeText("") } catch (_: Exception) {}
+                logText.text = ""
+            }
+        }
+        logText = TextView(this).apply { textSize = 11f; typeface = Typeface.MONOSPACE; setTextIsSelectable(true) }
+        logScroll = ScrollView(this).apply { addView(logText) }
+        logPanel.addView(row(backBtn, shareBtn, clearBtn), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        logPanel.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+
+        val root = FrameLayout(this)
+        root.addView(mainView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        root.addView(logPanel, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         setContentView(root)
+
+        loadPreviousLog()
+        log("App opened. ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}), Google Play services ${playServicesVersion()}, device id $myId")
         refreshButtons()
     }
 
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (logVisible) showLogs(false) else super.onBackPressed()
+    }
+
     override fun onDestroy() {
-        if (running) stopNearby()
+        if (running) stopSession()
         super.onDestroy()
     }
 
     private fun refreshButtons() {
         roleBtn.isEnabled = !running
         roleBtn.text = if (isSpeaker) "Role: SPEAKER (tap to change)" else "Role: Listener (tap to change)"
-        lockBtn.isEnabled = running && !locked
-        lockBtn.text = if (locked) "Links locked" else "Stop searching (lock links)"
+        toggle.text = if (running) "Stop session" else "Start session"
+        searchBtn.isEnabled = running
+        searchBtn.text = if (searching) "Searching... (tap to stop)" else "Search for devices"
         talkBtn.isEnabled = running && isSpeaker
         talkBtn.text = when {
             !isSpeaker -> "Listening (only the speaker can talk)"
             broadcasting -> "Stop broadcasting"
             else -> "Start broadcasting"
         }
+    }
+
+    // ---------- logging ----------
+
+    private fun log(msg: String) {
+        val line = "${timeFmt.format(Date())} $msg"
+        logLines.add(line)
+        if (logLines.size > 4000) logLines.removeAt(0)
+        try { logFile.appendText(line + "\n") } catch (_: Exception) {}
+        if (logVisible) {
+            logText.append(line + "\n")
+            logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    private fun loadPreviousLog() {
+        try {
+            if (logFile.exists()) {
+                if (logFile.length() > 500_000) { logFile.delete(); return }
+                val prev = logFile.readLines().takeLast(300)
+                if (prev.isNotEmpty()) {
+                    logLines.add("---- previous run (last ${prev.size} lines) ----")
+                    logLines.addAll(prev)
+                    logLines.add("---- new run ----")
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun showLogs(show: Boolean) {
+        logVisible = show
+        mainView.visibility = if (show) View.GONE else View.VISIBLE
+        logPanel.visibility = if (show) View.VISIBLE else View.GONE
+        if (show) {
+            logText.text = logLines.joinToString("\n") + "\n"
+            logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    private fun shareLog() {
+        val header = "multilinked log from \"${nameInput.text}\" (${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE})\n"
+        val text = header + logLines.joinToString("\n")
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "multilinked log ${nameInput.text}")
+            putExtra(Intent.EXTRA_TEXT, text.takeLast(100_000))
+        }
+        startActivity(Intent.createChooser(send, "Share log"))
+    }
+
+    private fun describe(e: Exception): String =
+        if (e is ApiException) "code ${e.statusCode} (${ConnectionsStatusCodes.getStatusCodeString(e.statusCode)})"
+        else (e.message ?: e.toString())
+
+    private fun playServicesVersion(): String = try {
+        packageManager.getPackageInfo("com.google.android.gms", 0).versionName ?: "unknown"
+    } catch (_: Exception) { "unknown" }
+
+    private fun logRadioState() {
+        val bt = try {
+            (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter?.isEnabled
+        } catch (_: Exception) { null }
+        val wifi = try {
+            (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).isWifiEnabled
+        } catch (_: Exception) { null }
+        val loc = try {
+            if (Build.VERSION.SDK_INT >= 28)
+                (getSystemService(Context.LOCATION_SERVICE) as LocationManager).isLocationEnabled
+            else null
+        } catch (_: Exception) { null }
+        fun f(b: Boolean?) = when (b) { true -> "ON"; false -> "OFF"; null -> "unknown" }
+        log("Radios: bluetooth ${f(bt)}, wifi ${f(wifi)}, location ${f(loc)}")
+        val missing = neededPermissions().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        log(if (missing.isEmpty()) "Permissions: all granted" else "Permissions MISSING: ${missing.joinToString { it.substringAfterLast('.') }}")
+    }
+
+    private fun logStats() {
+        val parts = ArrayList<String>()
+        for ((ep, st) in txStats) {
+            if (st.sent + st.dropped == 0) continue
+            val name = neighbors[ep] ?: ep.take(4)
+            val avg = if (st.done > 0) st.sumMs / st.done else 0
+            parts.add("to $name: sent ${st.sent}, dropped ${st.dropped}, failed ${st.failed}, send time avg ${avg}ms max ${st.maxMs}ms")
+        }
+        txStats.clear()
+        if (rxFrames + rxGaps + rxStale > 0) {
+            parts.add("received $rxFrames frames, $rxGaps missing, $rxStale late/duplicate")
+            rxFrames = 0; rxGaps = 0; rxStale = 0
+        }
+        val t = track
+        if (t != null && Build.VERSION.SDK_INT >= 24) parts.add("playback underruns so far ${t.underrunCount}")
+        if (parts.isNotEmpty()) log("STATS " + parts.joinToString(" | "))
     }
 
     // ---------- permissions ----------
@@ -180,73 +361,105 @@ class MainActivity : Activity() {
 
     private fun requestPermsThenStart() {
         val missing = neededPermissions().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isEmpty()) startNearby() else requestPermissions(missing.toTypedArray(), 1)
+        if (missing.isEmpty()) startSession() else {
+            log("Asking for permissions: ${missing.joinToString { it.substringAfterLast('.') }}")
+            requestPermissions(missing.toTypedArray(), 1)
+        }
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
-        if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) startNearby()
-        else statusView.text = "Permissions denied. Allow them in Settings and press Start again."
+        if (results.isNotEmpty() && results.all { it == PackageManager.PERMISSION_GRANTED }) startSession()
+        else {
+            statusView.text = "Permissions denied. Allow them in Settings and press Start again."
+            log("Permissions DENIED: ${perms.indices.filter { results.getOrNull(it) != PackageManager.PERMISSION_GRANTED }.joinToString { perms[it].substringAfterLast('.') }}")
+        }
     }
 
-    // ---------- start / stop ----------
+    // ---------- session + search ----------
 
-    private fun startNearby() {
+    private fun startSession() {
         myName = nameInput.text.toString().trim().ifEmpty { "?" }
         allowed = allowedInput.text.toString().split(",")
             .map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
-
-        val adv = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        client.startAdvertising("$myId|$myName", serviceId, connectionCallback, adv)
-            .addOnFailureListener { statusView.text = "Advertising failed: ${it.message}" }
-
-        val disc = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        client.startDiscovery(serviceId, discoveryCallback, disc)
-            .addOnFailureListener { statusView.text = "Discovery failed: ${it.message}" }
-
         running = true
-        locked = false
         dropped = 0
-        toggle.text = "Stop"
+        tickCount = 0
         nameInput.isEnabled = false
         allowedInput.isEnabled = false
+        log("SESSION start: name \"$myName\", role ${if (isSpeaker) "SPEAKER" else "listener"}, allowed ${if (allowed.isEmpty()) "anyone" else allowed.joinToString(",")}")
+        logRadioState()
         refreshButtons()
         updateStatus()
         handler.postDelayed(tick, 2000)
+        startSearch()
     }
 
-    // Stop searching/advertising so the radio is used for audio only
-    private fun lockLinks() {
-        client.stopAdvertising()
-        client.stopDiscovery()
-        locked = true
-        refreshButtons()
-        addLine("[search stopped: links locked]")
-    }
-
-    private fun stopNearby() {
+    private fun stopSession() {
         stopBroadcast()
+        stopSearch("session stopped")
         handler.removeCallbacks(endRunnable)
         handler.removeCallbacks(tick)
         stopTrack()
-        client.stopAdvertising()
-        client.stopDiscovery()
         client.stopAllEndpoints()
         neighbors.clear()
         pending.clear()
+        pendingSince.clear()
         inFlight.clear()
+        txStats.clear()
         running = false
-        locked = false
-        toggle.text = "Start"
         nameInput.isEnabled = true
         allowedInput.isEnabled = true
+        log("SESSION stopped")
         refreshButtons()
         statusView.text = "Stopped"
     }
 
+    // Advertise + discover together. Stops at the first new link or after searchSeconds.
+    private fun startSearch() {
+        if (!running || searching) return
+        searching = true
+        refreshButtons()
+        log("SEARCH start (auto-stops at first new link or after $searchSeconds s). Both phones must be searching to find each other.")
+
+        val adv = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        client.startAdvertising("$myId|$myName", serviceId, connectionCallback, adv)
+            .addOnSuccessListener { log("advertising started") }
+            .addOnFailureListener { log("advertising FAILED: ${describe(it)}"); statusView.text = "Advertising failed: ${describe(it)}" }
+
+        val disc = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+        client.startDiscovery(serviceId, discoveryCallback, disc)
+            .addOnSuccessListener { log("discovery started") }
+            .addOnFailureListener { log("discovery FAILED: ${describe(it)}"); statusView.text = "Discovery failed: ${describe(it)}" }
+
+        handler.postDelayed(searchTimeout, searchSeconds * 1000L)
+        updateStatus()
+    }
+
+    private fun stopSearch(reason: String) {
+        if (!searching) return
+        searching = false
+        handler.removeCallbacks(searchTimeout)
+        client.stopAdvertising()
+        client.stopDiscovery()
+        log("SEARCH stop: $reason")
+        refreshButtons()
+        updateStatus()
+    }
+
     private fun updateStatus() {
         val n = if (neighbors.isEmpty()) "none yet" else neighbors.values.joinToString(", ")
-        statusView.text = "Running as $myName | links: $n | frames dropped (slow link): $dropped"
+        statusView.text = "Running as $myName | links: $n | ${if (searching) "SEARCHING" else "not searching"} | frames dropped: $dropped"
+    }
+
+    private fun clearStalePending() {
+        val now = SystemClock.elapsedRealtime()
+        val stale = pendingSince.filter { now - it.value > 15000 }.keys.toList()
+        for (id in stale) {
+            pendingSince.remove(id)
+            val n = pending.remove(id)
+            log("connection attempt with $n ($id) never finished after 15 s: cleared")
+        }
     }
 
     // ---------- discovery + connections ----------
@@ -260,40 +473,67 @@ class MainActivity : Activity() {
 
     private val discoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
-            val (remoteId, remoteName) = parse(info.endpointName) ?: return
-            if (!isAllowed(remoteName)) return
-            if (neighbors.containsKey(endpointId) || pending.containsKey(endpointId)) return
-            if (myId < remoteId) {
-                client.requestConnection("$myId|$myName", endpointId, connectionCallback)
-                    .addOnFailureListener { statusView.text = "Connect failed: ${it.message}" }
+            val parsed = parse(info.endpointName)
+            if (parsed == null) { log("found $endpointId with unreadable name \"${info.endpointName}\": ignored"); return }
+            val (remoteId, remoteName) = parsed
+            when {
+                !isAllowed(remoteName) ->
+                    log("found \"$remoteName\" ($remoteId): IGNORED, not in my allowed list (${allowed.joinToString(",")})")
+                neighbors.containsKey(endpointId) ->
+                    log("found \"$remoteName\" ($remoteId): already linked")
+                pending.containsKey(endpointId) ->
+                    log("found \"$remoteName\" ($remoteId): connection already in progress")
+                myId < remoteId -> {
+                    log("found \"$remoteName\" ($remoteId): I start the connection")
+                    pending[endpointId] = remoteName
+                    pendingSince[endpointId] = SystemClock.elapsedRealtime()
+                    client.requestConnection("$myId|$myName", endpointId, connectionCallback)
+                        .addOnFailureListener {
+                            pending.remove(endpointId); pendingSince.remove(endpointId)
+                            log("request to \"$remoteName\" FAILED: ${describe(it)}")
+                        }
+                }
+                else -> log("found \"$remoteName\" ($remoteId): waiting for them to start the connection (they must be searching too)")
             }
         }
-        override fun onEndpointLost(endpointId: String) {}
+
+        override fun onEndpointLost(endpointId: String) {
+            log("endpoint lost: $endpointId")
+        }
     }
 
     private val connectionCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
             val parsed = parse(info.endpointName)
             if (parsed == null || !isAllowed(parsed.second)) {
+                log("connection request from \"${info.endpointName}\": REJECTED (not allowed)")
                 client.rejectConnection(endpointId)
                 return
             }
+            log("connection with \"${parsed.second}\" initiated: accepting")
             pending[endpointId] = parsed.second
+            pendingSince[endpointId] = SystemClock.elapsedRealtime()
             client.acceptConnection(endpointId, payloadCallback)
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             val name = pending.remove(endpointId)
+            pendingSince.remove(endpointId)
+            val code = result.status.statusCode
             if (result.status.isSuccess && name != null) {
                 neighbors[endpointId] = name
-                addLine("[linked with $name]")
+                addLine("[linked with $name] (now ${neighbors.size} link${if (neighbors.size == 1) "" else "s"})")
+                stopSearch("linked with $name")
+            } else {
+                log("connection with ${name ?: endpointId} FAILED: code $code (${ConnectionsStatusCodes.getStatusCodeString(code)})")
             }
             updateStatus()
         }
 
         override fun onDisconnected(endpointId: String) {
             val name = neighbors.remove(endpointId)
-            if (name != null) addLine("[link with $name dropped]")
+            if (name != null) addLine("[link with $name dropped] (now ${neighbors.size} link${if (neighbors.size == 1) "" else "s"})")
+            else log("disconnected from unknown endpoint $endpointId")
             updateStatus()
         }
     }
@@ -317,13 +557,22 @@ class MainActivity : Activity() {
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
             val bytes = payload.asBytes() ?: return
-            try { handleIncoming(bytes, endpointId) } catch (_: Exception) {}
+            try { handleIncoming(bytes, endpointId) }
+            catch (e: Exception) { log("bad packet from ${neighbors[endpointId] ?: endpointId}: ${e.message}") }
         }
 
-        // A sent frame has left the queue: free up a slot for that link
+        // A sent frame has left the queue: free a slot for that link and record how long it took
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
-            if (update.status != PayloadTransferUpdate.Status.IN_PROGRESS) {
-                inFlight.remove(update.payloadId)
+            if (update.status == PayloadTransferUpdate.Status.IN_PROGRESS) return
+            val entry = inFlight.remove(update.payloadId) ?: return
+            val st = txStats.getOrPut(entry.first) { LinkStats() }
+            if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
+                val ms = SystemClock.elapsedRealtime() - entry.second
+                st.done++
+                st.sumMs += ms
+                if (ms > st.maxMs) st.maxMs = ms
+            } else {
+                st.failed++
             }
         }
     }
@@ -340,8 +589,11 @@ class MainActivity : Activity() {
 
         // Only accept frames newer than the last one: drops duplicates (loops) and late frames
         val last = lastSeq[sid]
-        if (last != null && seq <= last) return
+        if (last != null && seq <= last) { rxStale++; return }
+        if (last == null) log("new stream from ${String(nameBytes)} via ${neighbors[from] ?: from}, ${hops + 1} hop(s)")
+        else if (seq > last + 1) rxGaps += seq - last - 1
         lastSeq[sid] = seq
+        rxFrames++
 
         val forward = bytes.copyOf()
         forward[hopsOffset] = (hops + 1).toByte()
@@ -356,10 +608,12 @@ class MainActivity : Activity() {
         inFlight.entries.removeIf { now - it.value.second > 1000 }   // safety: forget stale entries
         for (endpoint in neighbors.keys) {
             if (endpoint == except) continue
+            val st = txStats.getOrPut(endpoint) { LinkStats() }
             val waiting = inFlight.values.count { it.first == endpoint }
-            if (waiting >= maxInFlight) { dropped++; continue }       // link is behind: drop this frame
+            if (waiting >= maxInFlight) { dropped++; st.dropped++; continue }   // link is behind: drop
             val payload = Payload.fromBytes(packet)
             inFlight[payload.id] = Pair(endpoint, now)
+            st.sent++
             client.sendPayload(endpoint, payload)
         }
     }
@@ -403,6 +657,7 @@ class MainActivity : Activity() {
         if (rec.state != AudioRecord.STATE_INITIALIZED) {
             rec.release()
             statusView.text = "Could not open the microphone"
+            log("microphone could not be opened")
             return
         }
 
@@ -410,7 +665,7 @@ class MainActivity : Activity() {
         lastSeq[sid] = Int.MAX_VALUE        // ignore our own frames if they loop back to us
         broadcasting = true
         refreshButtons()
-        addLine("[you are broadcasting]")
+        addLine("[you are broadcasting]${if (searching) " (note: still searching)" else ""}")
 
         Thread {
             val pcm = ByteArray(pcmFrameBytes)
@@ -489,6 +744,7 @@ class MainActivity : Activity() {
         if (!trackStarted && framesQueued >= prebufferFrames) {
             t.play()
             trackStarted = true
+            log("playback started")
         }
         handler.removeCallbacks(endRunnable)
         handler.postDelayed(endRunnable, 1500)         // no frames for 1.5 s = speaker stopped
@@ -502,8 +758,10 @@ class MainActivity : Activity() {
         track = null
     }
 
+    // shows a line on the main screen and records it in the log
     private fun addLine(line: String) {
         chatView.append(line + "\n")
         scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+        log(line)
     }
 }
