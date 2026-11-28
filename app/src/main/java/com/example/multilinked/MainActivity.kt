@@ -3,6 +3,7 @@ package com.example.multilinked
 import android.Manifest
 import android.app.Activity
 import android.bluetooth.BluetoothManager
+import android.content.ClipData
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -29,6 +30,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.core.content.FileProvider
 import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.AdvertisingOptions
@@ -55,68 +57,58 @@ import kotlin.random.Random
 /**
  * multilinked: offline chain-relay LIVE voice (one speaker, everyone else listens).
  *
- * Links: any number of links can stay connected.
- * Tree:  for each broadcast, audio is first flooded briefly. Each phone then picks ONE
- *        parent (the neighbour that delivered it in the fewest hops) and sends PRUNE
- *        ("do not send me this stream") to its other neighbours. Phones only forward
- *        audio to neighbours that have not pruned them, so the audio flows along a tree
- *        and the extra links sit idle as spare routes.
- * Heal:  if the parent link drops or no new frames arrive for 0.8 s, the phone sends
- *        GRAFT ("send it to me again") to all neighbours and picks a new parent.
+ * Network shape: always a TREE. Every phone carries a group id. Two phones that are
+ * already in the same group never link (that link would close a loop). When two
+ * groups link they merge into one group id; when a link drops, each side gets a
+ * fresh group id so the halves can rejoin later.
+ * Audio: because the network is a tree, a frame is simply passed on to every
+ * neighbour except the one it came from. No duplicates, no routing decisions.
+ * Playback: the phone keeps its audio buffer near 240 ms. If it falls behind it
+ * skips frames to catch up; if it runs dry it waits for a cushion to rebuild.
  */
 class MainActivity : Activity() {
 
     private val serviceId = "com.example.multilinked"
     private val myId = UUID.randomUUID().toString().take(6)
+    private var groupId = myId                                // changes as groups merge / split
     private lateinit var client: ConnectionsClient
 
     private val neighbors = mutableMapOf<String, String>()    // endpointId -> device name
     private val idOf = HashMap<String, String>()              // endpointId -> device id (for logs)
     private val pending = mutableMapOf<String, String>()      // endpointId -> device name (connecting)
     private val pendingSince = mutableMapOf<String, Long>()
+    private val loopLinks = HashSet<String>()                 // links being closed because they made a loop
     private var running = false
     private var searching = false
     private var myName = ""
     private var allowed = setOf<String>()                     // empty = link with anyone
     private var isSpeaker = false
     private val searchSeconds = 30
+    private val maxLinks = 5
 
     // packet types
     private val tAudio = 1
-    private val tPrune = 2
-    private val tGraft = 3
+    private val tHello = 2                                    // "my group is X" (sent right after linking)
+    private val tGroup = 3                                    // "the group is now X" (flooded through the tree)
 
     // audio: 480 samples (60 ms) -> 480 mu-law bytes on the wire, 960 bytes of PCM16 locally
     private val sampleRate = 8000
     private val frameSamples = 480
+    private val frameMs = 60L
     private val pcmFrameBytes = frameSamples * 2
-    private val prebufferFrames = 3
 
-    // tree settings
-    private val decideAfterMs = 400L      // how long to flood before choosing a parent
-    private val healAfterMs = 800L        // silence that makes a phone look for a new parent
+    // playback delay control
+    private val prebufferFrames = 4                           // 240 ms cushion before (re)starting playback
+    private val maxBufferMs = 400L                            // above this, skip frames to catch up
 
     // send queue limit per link
     private val maxInFlight = 4
     private val inFlight = HashMap<Long, Pair<String, Long>>()  // payloadId -> (endpoint, time sent)
     private var dropped = 0
 
-    // per-stream tree state
-    private class StreamState(val sid: Int, var startedAt: Long) {
-        val bestHops = HashMap<String, Int>()     // neighbour -> fewest hops it delivered
-        val order = HashMap<String, Int>()        // neighbour -> order of first delivery
-        val pruned = HashSet<String>()            // neighbours that asked us NOT to send this stream
-        var parent: String? = null
-        var decided = false
-        var isRoot = false                        // true on the speaker for its own stream
-        var lastNewFrameAt = startedAt
-        var lastGraftAt = 0L
-    }
-    private val streams = HashMap<Int, StreamState>()
-
     // statistics, summarised in the log every ~6 s
     private class LinkStats {
-        var sent = 0; var skipped = 0; var dropped = 0; var done = 0; var failed = 0
+        var sent = 0; var dropped = 0; var done = 0; var failed = 0
         var sumMs = 0L; var maxMs = 0L
     }
     private val txStats = HashMap<String, LinkStats>()
@@ -128,6 +120,14 @@ class MainActivity : Activity() {
     private var rxMaxGap = 0L
     private var gapSid = 0
     private var gapLastAt = 0L
+    private var driftInit = false
+    private var driftSid = 0
+    private var driftBaseAt = 0L
+    private var driftBaseSeq = 0
+    private var driftNow = 0L
+    private var driftMin = 0L
+    private var driftMax = 0L
+    private var spkDelayMax = 0L
     private var tickCount = 0
 
     @Volatile private var broadcasting = false
@@ -138,7 +138,10 @@ class MainActivity : Activity() {
     private var framesQueued = 0
     private var framesWritten = 0L
     private var playbackOverflow = 0
+    private var rebuffers = 0
+    private var skippedForDelay = 0
     private var trackStarted = false
+    private var firstPlayLogged = false
     private val handler = Handler(Looper.getMainLooper())
 
     private val endRunnable = Runnable {
@@ -153,21 +156,6 @@ class MainActivity : Activity() {
             tickCount++
             if (tickCount % 3 == 0) logStats()
             handler.postDelayed(this, 2000)
-        }
-    }
-    // watches for a stream that stopped arriving while we expected it
-    private val watch = object : Runnable {
-        override fun run() {
-            if (!running) return
-            val now = SystemClock.elapsedRealtime()
-            for (st in streams.values.toList()) {
-                if (st.isRoot || !st.decided || st.parent == null) continue
-                val quiet = now - st.lastNewFrameAt
-                if (quiet >= healAfterMs && now - st.lastGraftAt > 1500) {
-                    heal(st, "no new frames for $quiet ms")
-                }
-            }
-            handler.postDelayed(this, 400)
         }
     }
 
@@ -252,7 +240,8 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         val backBtn = Button(this).apply { text = "Back"; setOnClickListener { showLogs(false) } }
-        val shareBtn = Button(this).apply { text = "Share"; setOnClickListener { shareLog() } }
+        val shareBtn = Button(this).apply { text = "Text"; setOnClickListener { shareLog() } }
+        val fileBtn = Button(this).apply { text = "File"; setOnClickListener { shareLogFile() } }
         val clearBtn = Button(this).apply {
             text = "Clear"
             setOnClickListener {
@@ -263,7 +252,7 @@ class MainActivity : Activity() {
         }
         logText = TextView(this).apply { textSize = 11f; typeface = Typeface.MONOSPACE; setTextIsSelectable(true) }
         logScroll = ScrollView(this).apply { addView(logText) }
-        logPanel.addView(row(backBtn, shareBtn, clearBtn), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        logPanel.addView(row(backBtn, shareBtn, fileBtn, clearBtn), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         logPanel.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
 
         val root = FrameLayout(this)
@@ -272,7 +261,7 @@ class MainActivity : Activity() {
         setContentView(root)
 
         loadPreviousLog()
-        log("App opened. ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}), Google Play services ${playServicesVersion()}, device id $myId. Build: tree routing v1")
+        log("App opened. ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT}), Google Play services ${playServicesVersion()}, device id $myId. Build: tree-only links v1")
         refreshButtons()
     }
 
@@ -337,15 +326,38 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun logHeader(): String =
+        "multilinked log from \"${nameInput.text}\"/$myId (${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE})\n"
+
     private fun shareLog() {
-        val header = "multilinked log from \"${nameInput.text}\"/$myId (${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE})\n"
-        val text = header + logLines.joinToString("\n")
+        val text = logHeader() + logLines.joinToString("\n")
         val send = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_SUBJECT, "multilinked log ${nameInput.text}")
             putExtra(Intent.EXTRA_TEXT, text.takeLast(100_000))
         }
         startActivity(Intent.createChooser(send, "Share log"))
+    }
+
+    // Shares the whole log as a text file (no copy-paste size limit)
+    private fun shareLogFile() {
+        try {
+            val tag = nameInput.text.toString().filter { it.isLetterOrDigit() }.ifEmpty { "phone" }
+            val f = File(filesDir, "multilinked-log-$tag.txt")
+            f.writeText(logHeader() + logLines.joinToString("\n") + "\n")
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", f)
+            val send = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, "multilinked log $tag")
+                clipData = ClipData.newRawUri("log", uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(send, "Share log file"))
+        } catch (e: Exception) {
+            log("could not share the log file: ${e.message}")
+            statusView.text = "Could not share the log file: ${e.message}"
+        }
     }
 
     private fun describe(e: Exception): String =
@@ -355,8 +367,6 @@ class MainActivity : Activity() {
     private fun playServicesVersion(): String = try {
         packageManager.getPackageInfo("com.google.android.gms", 0).versionName ?: "unknown"
     } catch (_: Exception) { "unknown" }
-
-    private fun hex(sid: Int): String = Integer.toHexString(sid)
 
     // "Name/deviceId" so two phones with the same name can be told apart
     private fun label(ep: String): String {
@@ -386,41 +396,34 @@ class MainActivity : Activity() {
         log(if (missing.isEmpty()) "Permissions: all granted" else "Permissions MISSING: ${missing.joinToString { it.substringAfterLast('.') }}")
     }
 
-    private fun treeInfo(): String? {
-        val now = SystemClock.elapsedRealtime()
-        val st = streams.values.maxByOrNull { it.lastNewFrameAt } ?: return null
-        if (now - st.lastNewFrameAt > 20000) return null
-        val p = st.parent
-        val role = when {
-            st.isRoot -> "I am the ROOT"
-            p != null -> "parent ${label(p)}"
-            else -> "parent undecided"
-        }
-        val skip = if (st.pruned.isEmpty()) "nobody" else st.pruned.joinToString(", ") { label(it) }
-        return "TREE ${hex(st.sid)}: $role, not sending to: $skip"
-    }
-
     private fun logStats() {
         val parts = ArrayList<String>()
         for ((ep, st) in txStats) {
-            if (st.sent + st.dropped + st.skipped == 0) continue
+            if (st.sent + st.dropped == 0) continue
             val avg = if (st.done > 0) st.sumMs / st.done else 0
-            parts.add("to ${label(ep)}: sent ${st.sent}, skipped(pruned) ${st.skipped}, dropped ${st.dropped}, failed ${st.failed}, send time avg ${avg}ms max ${st.maxMs}ms")
+            parts.add("to ${label(ep)}: sent ${st.sent}, dropped ${st.dropped}, failed ${st.failed}, send time avg ${avg}ms max ${st.maxMs}ms")
         }
         txStats.clear()
         if (rxFrames + rxGaps + rxStale > 0) {
             val by = (rxNew.keys + rxDup.keys).toSet().joinToString(", ") { "${label(it)} ${rxNew[it] ?: 0} new/${rxDup[it] ?: 0} dup" }
             parts.add("received $rxFrames new frames ($rxGaps missing, $rxStale duplicate/late) by neighbour: $by; longest gap between new frames ${rxMaxGap}ms")
+            val warn = rxDup.filter { it.value > 3 }.keys
+            if (warn.isNotEmpty()) parts.add("WARNING: duplicate frames from ${warn.joinToString(", ") { label(it) }} (a loop may exist)")
+            parts.add("arrival timing vs first frame: now ${driftNow}ms, window ${driftMin}..${driftMax}ms (rising = delay building up in transit)")
             rxFrames = 0; rxGaps = 0; rxStale = 0; rxMaxGap = 0
             rxNew.clear(); rxDup.clear()
+            driftMin = driftNow; driftMax = driftNow
+        }
+        if (broadcasting) {
+            parts.add("speaker: capture-to-send delay max ${spkDelayMax}ms")
+            spkDelayMax = 0
         }
         val t = track
         if (t != null) {
-            val bufMs = if (trackStarted) ((framesWritten - t.playbackHeadPosition.toLong()) * 1000 / sampleRate) else 0
-            parts.add("playback: buffered about ${bufMs}ms, underruns so far ${t.underrunCount}, frames lost to a full buffer $playbackOverflow")
+            val bufMs = if (trackStarted) bufferedMs(t) else 0
+            parts.add("playback: buffered about ${bufMs}ms, device underruns ${t.underrunCount}, rebuffers $rebuffers, frames skipped to cut delay $skippedForDelay, frames lost to a full buffer $playbackOverflow")
         }
-        treeInfo()?.let { parts.add(it) }
-        if (parts.isNotEmpty()) log("STATS links[${linkList()}] " + parts.joinToString(" | "))
+        if (parts.isNotEmpty()) log("STATS group $groupId links[${linkList()}] " + parts.joinToString(" | "))
     }
 
     // ---------- permissions ----------
@@ -463,16 +466,16 @@ class MainActivity : Activity() {
         allowed = allowedInput.text.toString().split(",")
             .map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
         running = true
+        groupId = myId
         dropped = 0
         tickCount = 0
         nameInput.isEnabled = false
         allowedInput.isEnabled = false
-        log("SESSION start: name \"$myName\"/$myId, role ${if (isSpeaker) "SPEAKER" else "listener"}, allowed ${if (allowed.isEmpty()) "anyone" else allowed.joinToString(",")}")
+        log("SESSION start: name \"$myName\"/$myId, group $groupId, role ${if (isSpeaker) "SPEAKER" else "listener"}, allowed ${if (allowed.isEmpty()) "anyone" else allowed.joinToString(",")}")
         logRadioState()
         refreshButtons()
         updateStatus()
         handler.postDelayed(tick, 2000)
-        handler.postDelayed(watch, 400)
         startSearch()
     }
 
@@ -481,7 +484,6 @@ class MainActivity : Activity() {
         stopSearch("session stopped")
         handler.removeCallbacks(endRunnable)
         handler.removeCallbacks(tick)
-        handler.removeCallbacks(watch)
         stopTrack()
         running = false                     // set first so closing links are not logged as problems
         client.stopAllEndpoints()
@@ -489,10 +491,11 @@ class MainActivity : Activity() {
         idOf.clear()
         pending.clear()
         pendingSince.clear()
+        loopLinks.clear()
         inFlight.clear()
         txStats.clear()
-        streams.clear()
         rxNew.clear(); rxDup.clear()
+        groupId = myId
         nameInput.isEnabled = true
         allowedInput.isEnabled = true
         log("SESSION stopped")
@@ -500,15 +503,18 @@ class MainActivity : Activity() {
         statusView.text = "Stopped"
     }
 
+    // The name other phones read before connecting: "deviceId|groupId|name"
+    private fun advName(): String = "$myId|$groupId|$myName"
+
     // Advertise + discover together. Stops at the first new link or after searchSeconds.
     private fun startSearch() {
         if (!running || searching) return
         searching = true
         refreshButtons()
-        log("SEARCH start (auto-stops at first new link or after $searchSeconds s). Both phones must be searching to find each other.")
+        log("SEARCH start as group $groupId (auto-stops at first new link or after $searchSeconds s). Both phones must be searching to find each other.")
 
         val adv = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
-        client.startAdvertising("$myId|$myName", serviceId, connectionCallback, adv)
+        client.startAdvertising(advName(), serviceId, connectionCallback, adv)
             .addOnSuccessListener { log("advertising started") }
             .addOnFailureListener { log("advertising FAILED: ${describe(it)}"); statusView.text = "Advertising failed: ${describe(it)}" }
 
@@ -534,7 +540,7 @@ class MainActivity : Activity() {
 
     private fun updateStatus() {
         val n = if (neighbors.isEmpty()) "none yet" else neighbors.values.joinToString(", ")
-        statusView.text = "Running as $myName | links: $n | ${if (searching) "SEARCHING" else "not searching"} | frames dropped: $dropped"
+        statusView.text = "Running as $myName | group $groupId | links: $n | ${if (searching) "SEARCHING" else "not searching"} | frames dropped: $dropped"
     }
 
     private fun clearStalePending() {
@@ -548,39 +554,82 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- discovery + connections ----------
+    // ---------- groups (keeps the network a tree) ----------
 
-    private fun parse(s: String): Pair<String, String>? {
-        val i = s.indexOf('|')
-        return if (i < 0) null else Pair(s.substring(0, i), s.substring(i + 1))
+    private class Adv(val id: String, val group: String, val name: String)
+
+    private fun parse(s: String): Adv? {
+        val p = s.split("|", limit = 3)
+        return if (p.size < 3) null else Adv(p[0], p[1], p[2])
     }
 
     private fun isAllowed(name: String) = allowed.isEmpty() || allowed.contains(name.trim().lowercase())
 
+    private fun sendControl(ep: String, type: Int, text: String) {
+        val b = text.toByteArray()
+        val buf = ByteBuffer.allocate(2 + b.size)
+        buf.put(type.toByte())
+        buf.put(b.size.toByte())
+        buf.put(b)
+        client.sendPayload(ep, Payload.fromBytes(buf.array()))
+    }
+
+    // Adopt a new group id and pass it on to everyone except the phone that told us
+    private fun setGroup(g: String, why: String, except: String?) {
+        if (g == groupId) return
+        log("GROUP $groupId -> $g ($why)")
+        groupId = g
+        for (ep in neighbors.keys) if (ep != except) sendControl(ep, tGroup, g)
+        updateStatus()
+    }
+
+    // Right after linking: compare groups. The side with the larger id adopts the smaller one.
+    private fun handleHello(from: String, theirGroup: String) {
+        log("HELLO from ${label(from)}: their group $theirGroup, mine $groupId")
+        if (theirGroup == groupId) {
+            // Same group: this link closes a loop. Keep the network a tree by closing it.
+            loopLinks.add(from)
+            log("LOOP: ${label(from)} is already in my group, so this link makes a loop. Closing it.")
+            if (myId > (idOf[from] ?: "")) client.disconnectFromEndpoint(from)
+        } else if (theirGroup < groupId) {
+            setGroup(theirGroup, "merged with ${label(from)}", from)
+        }
+    }
+
+    private fun handleGroup(from: String, g: String) {
+        if (g != groupId) setGroup(g, "told by ${label(from)}", from)
+    }
+
+    // ---------- discovery + connections ----------
+
     private val discoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
-            val parsed = parse(info.endpointName)
-            if (parsed == null) { log("found $endpointId with unreadable name \"${info.endpointName}\": ignored"); return }
-            val (remoteId, remoteName) = parsed
-            idOf[endpointId] = remoteId
+            val adv = parse(info.endpointName)
+            if (adv == null) { log("found $endpointId with unreadable name \"${info.endpointName}\": ignored"); return }
+            idOf[endpointId] = adv.id
+            val who = "\"${adv.name}\"/${adv.id} (group ${adv.group})"
             when {
-                !isAllowed(remoteName) ->
-                    log("found \"$remoteName\"/$remoteId: IGNORED, not in my allowed list (${allowed.joinToString(",")})")
+                !isAllowed(adv.name) ->
+                    log("found $who: IGNORED, not in my allowed list (${allowed.joinToString(",")})")
                 neighbors.containsKey(endpointId) ->
-                    log("found \"$remoteName\"/$remoteId: already linked")
+                    log("found $who: already linked")
                 pending.containsKey(endpointId) ->
-                    log("found \"$remoteName\"/$remoteId: connection already in progress")
-                myId < remoteId -> {
-                    log("found \"$remoteName\"/$remoteId: I start the connection")
-                    pending[endpointId] = remoteName
+                    log("found $who: connection already in progress")
+                adv.group == groupId ->
+                    log("found $who: SKIPPED, already in my group, linking would make a loop")
+                neighbors.size >= maxLinks ->
+                    log("found $who: SKIPPED, I already have $maxLinks links")
+                myId < adv.id -> {
+                    log("found $who: I start the connection")
+                    pending[endpointId] = adv.name
                     pendingSince[endpointId] = SystemClock.elapsedRealtime()
-                    client.requestConnection("$myId|$myName", endpointId, connectionCallback)
+                    client.requestConnection(advName(), endpointId, connectionCallback)
                         .addOnFailureListener {
                             pending.remove(endpointId); pendingSince.remove(endpointId)
-                            log("request to \"$remoteName\"/$remoteId FAILED: ${describe(it)}")
+                            log("request to $who FAILED: ${describe(it)}")
                         }
                 }
-                else -> log("found \"$remoteName\"/$remoteId: waiting for them to start the connection (they must be searching too)")
+                else -> log("found $who: waiting for them to start the connection (they must be searching too)")
             }
         }
 
@@ -589,17 +638,24 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun rejectRequest(endpointId: String, from: String, why: String) {
+        log("connection request from $from: REJECTED ($why)")
+        pending.remove(endpointId)
+        pendingSince.remove(endpointId)
+        client.rejectConnection(endpointId)
+    }
+
     private val connectionCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-            val parsed = parse(info.endpointName)
-            if (parsed == null || !isAllowed(parsed.second)) {
-                log("connection request from \"${info.endpointName}\": REJECTED (not allowed)")
-                client.rejectConnection(endpointId)
-                return
-            }
-            idOf[endpointId] = parsed.first
-            log("connection with \"${parsed.second}\"/${parsed.first} initiated: accepting")
-            pending[endpointId] = parsed.second
+            val adv = parse(info.endpointName)
+            if (adv == null) { rejectRequest(endpointId, "\"${info.endpointName}\"", "unreadable name"); return }
+            idOf[endpointId] = adv.id
+            val who = "\"${adv.name}\"/${adv.id} (group ${adv.group})"
+            if (!isAllowed(adv.name)) { rejectRequest(endpointId, who, "not in my allowed list"); return }
+            if (adv.group == groupId) { rejectRequest(endpointId, who, "same group as mine, would make a loop"); return }
+            if (neighbors.size >= maxLinks) { rejectRequest(endpointId, who, "I already have $maxLinks links"); return }
+            log("connection with $who initiated: accepting")
+            pending[endpointId] = adv.name
             pendingSince[endpointId] = SystemClock.elapsedRealtime()
             client.acceptConnection(endpointId, payloadCallback)
         }
@@ -611,16 +667,10 @@ class MainActivity : Activity() {
             if (result.status.isSuccess && name != null) {
                 neighbors[endpointId] = name
                 addLine("[linked with ${label(endpointId)}] (now ${neighbors.size} link${if (neighbors.size == 1) "" else "s"})")
-                // A new neighbour during a live stream: tell it not to send us that stream
-                val now = SystemClock.elapsedRealtime()
-                for (st in streams.values) {
-                    if (!st.isRoot && st.parent != null && now - st.lastNewFrameAt < 5000) {
-                        sendControl(endpointId, tPrune, st.sid)
-                    }
-                }
+                sendControl(endpointId, tHello, groupId)
                 stopSearch("linked with ${label(endpointId)}")
             } else {
-                log("connection with ${name ?: endpointId} FAILED: code $code (${ConnectionsStatusCodes.getStatusCodeString(code)})")
+                log("connection with ${name ?: label(endpointId)} FAILED: code $code (${ConnectionsStatusCodes.getStatusCodeString(code)})")
             }
             updateStatus()
         }
@@ -631,9 +681,12 @@ class MainActivity : Activity() {
             val name = neighbors.remove(endpointId)
             if (name != null) {
                 addLine("[link with $lab dropped] (now ${neighbors.size} link${if (neighbors.size == 1) "" else "s"})")
-                for (st in streams.values.toList()) {
-                    st.pruned.remove(endpointId)
-                    if (!st.isRoot && st.parent == endpointId) heal(st, "parent $lab dropped")
+                if (loopLinks.remove(endpointId)) {
+                    log("that was a redundant loop link: the network is still one group")
+                } else {
+                    // The network just split in two. This side gets its own group id so the halves can rejoin later.
+                    val fresh = "$myId${Random.nextInt(256).toString(16)}"
+                    setGroup(fresh, "link with $lab dropped, my side needs its own group", null)
                 }
             } else {
                 log("closed link to $lab (it was not fully linked)")
@@ -644,7 +697,7 @@ class MainActivity : Activity() {
 
     // ---------- packets ----------
     // audio: [type 1][streamId 4][frame number 4][hops 1][nameLen 1][name][mu-law audio]
-    // prune/graft: [type 1][streamId 4]
+    // hello/group: [type 1][length 1][group id text]
 
     private val hopsOffset = 9
 
@@ -661,21 +714,15 @@ class MainActivity : Activity() {
         return buf.array()
     }
 
-    private fun sendControl(ep: String, type: Int, sid: Int) {
-        val b = ByteBuffer.allocate(5)
-        b.put(type.toByte())
-        b.putInt(sid)
-        client.sendPayload(ep, Payload.fromBytes(b.array()))
-    }
-
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
             val bytes = payload.asBytes() ?: return
-            if (bytes.isEmpty()) return
+            if (bytes.size < 2) return
             try {
                 when (bytes[0].toInt() and 0xFF) {
                     tAudio -> handleAudio(bytes, endpointId)
-                    tPrune, tGraft -> handleControl(bytes, endpointId)
+                    tHello -> handleHello(endpointId, String(bytes, 2, bytes[1].toInt() and 0xFF))
+                    tGroup -> handleGroup(endpointId, String(bytes, 2, bytes[1].toInt() and 0xFF))
                 }
             } catch (e: Exception) {
                 log("bad packet from ${label(endpointId)}: ${e.message}")
@@ -698,57 +745,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun stateFor(sid: Int): StreamState {
-        streams[sid]?.let { return it }
-        val st = StreamState(sid, SystemClock.elapsedRealtime())
-        streams[sid] = st
-        if (streams.size > 3) {
-            val victim = streams.values.filter { it !== st && !it.isRoot }.minByOrNull { it.startedAt }
-            if (victim != null) streams.remove(victim.sid)
-        }
-        return st
-    }
-
-    private fun handleControl(bytes: ByteArray, from: String) {
-        val type = bytes[0].toInt() and 0xFF
-        val sid = ByteBuffer.wrap(bytes).getInt(1)
-        val st = stateFor(sid)
-        if (type == tPrune) {
-            st.pruned.add(from)
-            log("PRUNE from ${label(from)} for stream ${hex(sid)}: I will not send it to them")
-        } else {
-            st.pruned.remove(from)
-            log("GRAFT from ${label(from)} for stream ${hex(sid)}: I will send it to them again")
-        }
-    }
-
-    // Choose the neighbour that delivered the stream in the fewest hops as the one parent
-    private fun decideParent(st: StreamState) {
-        val parent = st.bestHops.keys.filter { neighbors.containsKey(it) }
-            .minWithOrNull(compareBy<String>({ st.bestHops[it] ?: 99 }, { st.order[it] ?: 99 })) ?: return
-        st.parent = parent
-        st.decided = true
-        val others = neighbors.keys.filter { it != parent }
-        for (ep in others) sendControl(ep, tPrune, st.sid)
-        val heard = st.bestHops.entries.joinToString(", ") { "${label(it.key)}=${it.value}" }
-        log("TREE stream ${hex(st.sid)}: parent ${label(parent)} (heard hop counts: $heard); told ${others.size} other neighbour(s) not to send it to me: ${if (others.isEmpty()) "-" else others.joinToString(", ") { label(it) }}")
-    }
-
-    // Lost the parent: ask every neighbour to send the stream again, then choose again
-    private fun heal(st: StreamState, why: String) {
-        val now = SystemClock.elapsedRealtime()
-        log("HEAL stream ${hex(st.sid)}: $why. Asking ${neighbors.size} neighbour(s) to send it to me again")
-        st.parent = null
-        st.decided = false
-        st.bestHops.clear()
-        st.order.clear()
-        st.startedAt = now
-        st.lastGraftAt = now
-        st.lastNewFrameAt = now
-        for (ep in neighbors.keys) sendControl(ep, tGraft, st.sid)
-    }
-
-    // The relay rule, per audio frame: forward it onward (only to neighbours that want it), then play it
+    // The relay rule: pass each new frame to every neighbour except the one it came from, then play it
     private fun handleAudio(bytes: ByteArray, from: String) {
         val buf = ByteBuffer.wrap(bytes)
         buf.get()                                    // type
@@ -759,30 +756,30 @@ class MainActivity : Activity() {
         val nameBytes = ByteArray(nameLen); buf.get(nameBytes)
         val audio = ByteArray(buf.remaining()); buf.get(audio)
 
-        val st = stateFor(sid)
-        if (st.isRoot) { rxStale++; return }         // our own stream coming back to us
-
-        val now = SystemClock.elapsedRealtime()
-        val recvHops = hops + 1
-        val prev = st.bestHops[from]
-        if (prev == null) st.order[from] = st.order.size
-        if (prev == null || recvHops < prev) st.bestHops[from] = recvHops
-        if (!st.decided && now - st.startedAt >= decideAfterMs) decideParent(st)
-
-        // Only accept frames newer than the last one: drops duplicates (loops) and late frames
+        // The network is a tree so duplicates should not happen; if they do, drop them
         val last = lastSeq[sid]
         if (last != null && seq <= last) {
             rxStale++
             rxDup[from] = (rxDup[from] ?: 0) + 1
             return
         }
-        if (last == null) log("new stream ${hex(sid)} from ${String(nameBytes)} via ${label(from)}, $recvHops hop(s)")
+        val now = SystemClock.elapsedRealtime()
+        val recvHops = hops + 1
+        if (last == null) log("new stream from ${String(nameBytes)} via ${label(from)}, $recvHops hop(s)")
         else if (seq > last + 1) rxGaps += seq - last - 1
         lastSeq[sid] = seq
         rxFrames++
         rxNew[from] = (rxNew[from] ?: 0) + 1
-        st.lastNewFrameAt = now
 
+        // how late is this frame compared with when it "should" have arrived?
+        if (!driftInit || sid != driftSid) {
+            driftInit = true; driftSid = sid; driftBaseAt = now; driftBaseSeq = seq
+            driftNow = 0; driftMin = 0; driftMax = 0
+        } else {
+            driftNow = (now - driftBaseAt) - (seq - driftBaseSeq).toLong() * frameMs
+            if (driftNow < driftMin) driftMin = driftNow
+            if (driftNow > driftMax) driftMax = driftNow
+        }
         if (sid == gapSid && gapLastAt != 0L) {
             val g = now - gapLastAt
             if (g > rxMaxGap) rxMaxGap = g
@@ -792,20 +789,18 @@ class MainActivity : Activity() {
 
         val forward = bytes.copyOf()
         forward[hopsOffset] = (hops + 1).toByte()
-        forwardAudio(forward, from, st)
+        forwardAudio(forward, from)
 
         if (!isSpeaker) play(sid, String(nameBytes), recvHops, audio)
     }
 
-    // Send to every neighbour except one and except those that pruned us,
-    // but never let a slow link build up a backlog
-    private fun forwardAudio(packet: ByteArray, except: String?, st: StreamState?) {
+    // Send to every neighbour except one, but never let a slow link build up a backlog
+    private fun forwardAudio(packet: ByteArray, except: String?) {
         val now = SystemClock.elapsedRealtime()
         inFlight.entries.removeIf { now - it.value.second > 1000 }   // safety: forget stale entries
         for (endpoint in neighbors.keys) {
             if (endpoint == except) continue
             val ls = txStats.getOrPut(endpoint) { LinkStats() }
-            if (st != null && st.pruned.contains(endpoint)) { ls.skipped++; continue }
             val waiting = inFlight.values.count { it.first == endpoint }
             if (waiting >= maxInFlight) { dropped++; ls.dropped++; continue }   // link is behind: drop
             val payload = Payload.fromBytes(packet)
@@ -859,13 +854,11 @@ class MainActivity : Activity() {
         }
 
         val sid = Random.nextInt()
-        lastSeq[sid] = Int.MAX_VALUE        // ignore our own frames if they loop back to us
-        val root = stateFor(sid)
-        root.isRoot = true
-        root.decided = true
+        lastSeq[sid] = Int.MAX_VALUE        // ignore our own frames if they ever loop back to us
+        spkDelayMax = 0
         broadcasting = true
         refreshButtons()
-        addLine("[you are broadcasting, stream ${hex(sid)}, linked to: ${linkList()}]${if (searching) " (note: still searching)" else ""}")
+        addLine("[you are broadcasting, stream ${Integer.toHexString(sid)}, group $groupId, linked to: ${linkList()}]${if (searching) " (note: still searching)" else ""}")
 
         Thread {
             val pcm = ByteArray(pcmFrameBytes)
@@ -886,7 +879,12 @@ class MainActivity : Activity() {
                         audio[i] = muLawEncode(sample)
                     }
                     val packet = encode(sid, seq++, 0, myName, audio)
-                    handler.post { forwardAudio(packet, null, root) }   // send from the main thread
+                    val captured = SystemClock.elapsedRealtime()
+                    handler.post {                                     // send from the main thread
+                        val wait = SystemClock.elapsedRealtime() - captured
+                        if (wait > spkDelayMax) spkDelayMax = wait
+                        forwardAudio(packet, null)
+                    }
                 }
             } finally {
                 try { rec.stop() } catch (_: Exception) {}
@@ -908,7 +906,7 @@ class MainActivity : Activity() {
         stopTrack()
         val minBuf = AudioTrack.getMinBufferSize(
             sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val size = maxOf(minBuf, sampleRate)          // about 0.5 s buffer caps the delay
+        val size = maxOf(minBuf, sampleRate)          // about 0.5 s of room; we keep far less in it
         track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -928,13 +926,40 @@ class MainActivity : Activity() {
         framesQueued = 0
         framesWritten = 0
         playbackOverflow = 0
+        rebuffers = 0
+        skippedForDelay = 0
         trackStarted = false
+        firstPlayLogged = false
         addLine("$sender is speaking ($hops hop${if (hops == 1) "" else "s"})")
+    }
+
+    // how much audio is waiting to be played, in milliseconds
+    private fun bufferedMs(t: AudioTrack): Long {
+        val head = t.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+        return (framesWritten - head) * 1000 / sampleRate
     }
 
     private fun play(sid: Int, sender: String, hops: Int, audio: ByteArray) {
         if (track == null || sid != curSid) startTrack(sid, sender, hops)
         val t = track ?: return
+
+        if (trackStarted) {
+            val buffered = bufferedMs(t)
+            if (buffered <= 0) {
+                // ran dry: pause and wait for a cushion to build up again
+                t.pause()
+                trackStarted = false
+                framesQueued = 0
+                rebuffers++
+            } else if (buffered > maxBufferMs) {
+                // too far behind: skip this frame to bring the delay back down
+                skippedForDelay++
+                handler.removeCallbacks(endRunnable)
+                handler.postDelayed(endRunnable, 1500)
+                return
+            }
+        }
+
         val pcm = ByteArray(audio.size * 2)
         for (i in audio.indices) {
             val s = muLawDecode(audio[i])
@@ -948,7 +973,7 @@ class MainActivity : Activity() {
         if (!trackStarted && framesQueued >= prebufferFrames) {
             t.play()
             trackStarted = true
-            log("playback started")
+            if (!firstPlayLogged) { firstPlayLogged = true; log("playback started") }
         }
         handler.removeCallbacks(endRunnable)
         handler.postDelayed(endRunnable, 1500)         // no frames for 1.5 s = speaker stopped

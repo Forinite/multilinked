@@ -17,15 +17,17 @@ One phone is the SPEAKER, the rest LISTEN, in near real time, relayed phone to p
   A middle phone that needs two links has to search twice.
 - "Show logs" opens a timestamped log (Share sends it as text, Clear empties it).
 
-## How audio travels (tree routing)
-All links stay connected, but audio only flows along one path per phone:
-1. A broadcast is first sent to everyone for ~0.4 s.
-2. Each phone picks the neighbour that delivered it in the fewest hops as its PARENT and sends
-   PRUNE ("don't send me this stream") to its other neighbours.
-3. Phones only forward audio to neighbours that have not pruned them. Extra links sit idle.
-4. If the parent link drops, or no new frames arrive for 0.8 s, the phone sends GRAFT
-   ("send it to me again") to all neighbours and picks a new parent.
-The log shows TREE / PRUNE / GRAFT / HEAL lines and per-neighbour new vs duplicate counts.
+## How the network is kept a tree
+- Every phone carries a group id (shown in the status line and logs). Two phones in the same
+  group never link, because that link would close a loop. Linking two different groups merges
+  them (the smaller id wins). When a link drops, each side gets a fresh group id so the halves
+  can rejoin later. A phone also refuses more than 5 links.
+- Because the network is always a tree, audio is simply passed to every neighbour except the one
+  it came from. There is no pruning or healing: if a middle phone drops, the phones beyond it
+  lose the audio until you search and link them again.
+- Playback keeps about 240 ms buffered, skips frames if it falls more than 400 ms behind, and
+  pauses to rebuild the cushion if it runs dry.
+- Log screen buttons: Text (share as text), File (share the whole log as a file), Clear.
 
 ## Test the chain with 4 phones
 | Phone | Name | Only link with | Role     |
